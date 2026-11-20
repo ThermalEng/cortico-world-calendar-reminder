@@ -5,13 +5,15 @@
  * - 点任务提醒一次；区间任务按配置（once/daily/hourly/every_15m）提醒，并可选在结束时提醒「时间到了」
  */
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PushOptions, ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import { CALENDAR_REMINDER_CONFIG_GROUP, type CalendarReminderConfigSection, type IntervalRemindMode } from './config.ts';
 import type { NewIcsEventInput } from './ics.ts';
-import { syncCaldavAndSubscriptions, writeCaldavEvent } from './sources/caldav.ts';
-import { syncSystemCalendars, writeSystemCalendarEvent } from './sources/system.ts';
+import { normalizeCaldavUrl, syncCaldavAndSubscriptions, writeCaldavEvent } from './sources/caldav.ts';
+import { splitPathList, syncSystemCalendars, writeSystemCalendarEvent } from './sources/system.ts';
 import { isIntervalEvent, type CalendarEvent, type DiscoveredCalendar, type SyncSourceReport } from './sources/types.ts';
 import type { CalendarPanelItem, CalendarPanelState } from './webui.ts';
 import {
@@ -157,10 +159,20 @@ export class CalendarReminderWorld implements World {
   private host: WorldHost | undefined;
   private tickTimer: ReturnType<typeof setInterval> | undefined;
   private greetTimer: ReturnType<typeof setTimeout> | undefined;
-  private syncing = false;
+  private inflightSync: Promise<{ events: CalendarEvent[]; reports: SyncSourceReport[] }> | undefined;
+  private lastAttemptAt: number | undefined;
+  private lastAttemptFailed = false;
   private lastReports: SyncSourceReport[] = [];
+  private storeQueue: Promise<void> = Promise.resolve();
+  private dueQueue: Promise<DueNotification[]> = Promise.resolve([]);
 
   constructor(private readonly opts: CalendarReminderWorldOptions) {}
+
+  private withStoreLock<T>(fn: () => Promise<T> | T): Promise<T> {
+    const run = this.storeQueue.then(fn, fn);
+    this.storeQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
 
   private now(): number {
     return this.opts.now ? this.opts.now() : Date.now();
@@ -358,97 +370,219 @@ export class CalendarReminderWorld implements World {
   async tick(): Promise<void> {
     const now = this.now();
     const { file } = readStore(this.opts.dataDir);
-    const elapsed = file.lastSyncAt === undefined ? Infinity : now - file.lastSyncAt;
-    if (elapsed >= this.syncIntervalMs()) {
+    const refTime = this.lastAttemptAt ?? file.lastSyncAt;
+    const elapsed = refTime === undefined ? Infinity : now - refTime;
+    const interval = this.lastAttemptFailed
+      ? Math.min(this.syncIntervalMs(), 60_000)
+      : this.syncIntervalMs();
+    if (elapsed >= interval && !this.inflightSync) {
       await this.syncNow();
     }
     await this.checkAndPushDue();
   }
 
-  /** 执行一次日历同步并落盘。 */
+  /** 执行一次日历同步并落盘；若有并发同步正在进行，先等待其结束后再按最新配置执行一次同步。 */
   async syncNow(): Promise<{ events: CalendarEvent[]; reports: SyncSourceReport[] }> {
-    if (this.syncing) {
-      return { events: readStore(this.opts.dataDir).file.events, reports: this.lastReports };
+    while (this.inflightSync) {
+      await this.inflightSync.catch(() => undefined);
     }
-    this.syncing = true;
+    const run = this.runSyncNow();
+    this.inflightSync = run;
     try {
-      const now = this.now();
-      const lookaheadDays = Number.isFinite(this.opts.cfg.lookaheadDays)
-        ? Math.max(1, Math.min(30, Math.round(this.opts.cfg.lookaheadDays)))
-        : 7;
-      // 回看 1 天以覆盖跨天或正在进行中的区间日程
-      const windowStartMs = now - 24 * 60 * 60_000;
-      const windowEndMs = now + lookaheadDays * 24 * 60 * 60_000;
-
-      let events: CalendarEvent[];
-      let calendars: DiscoveredCalendar[];
-      let reports: SyncSourceReport[];
-
-      if (this.opts.syncSources) {
-        const res = await this.opts.syncSources(windowStartMs, windowEndMs);
-        events = res.events;
-        calendars = res.calendars ?? [];
-        reports = res.reports;
-      } else {
-        const [sysRes, caldavRes] = await Promise.all([
-          syncSystemCalendars({
-            systemCalendarEnabled: this.opts.cfg.systemCalendarEnabled,
-            localIcsPaths: this.opts.cfg.localIcsPaths,
-            windowStartMs,
-            windowEndMs,
-            defaultTimezone: this.opts.timezone,
-          }),
-          syncCaldavAndSubscriptions({
-            urlsRaw: this.opts.cfg.caldavUrl,
-            username: this.opts.cfg.caldavUsername,
-            password: this.opts.cfg.caldavPassword,
-            windowStartMs,
-            windowEndMs,
-            defaultTimezone: this.opts.timezone,
-          }),
-        ]);
-        const dedup = new Map<string, CalendarEvent>();
-        for (const ev of [...sysRes.events, ...caldavRes.events]) dedup.set(ev.key, ev);
-        events = [...dedup.values()].sort((a, b) => a.startMs - b.startMs);
-        calendars = [...sysRes.calendars, ...caldavRes.calendars];
-        reports = [...sysRes.reports, ...caldavRes.reports];
-      }
-
-      this.lastReports = reports;
-      for (const rep of reports) {
-        if (rep.error) {
-          this.host?.log.warn(`日历源同步异常 [${rep.source}]: ${rep.error}`);
-        }
-      }
-
-      const { file } = readStore(this.opts.dataDir);
-      file.events = events;
-      file.calendars = calendars;
-      file.lastSyncAt = now;
-      pruneStates(file, now);
-      writeStore(this.opts.dataDir, file);
-      return { events, reports };
+      return await run;
     } finally {
-      this.syncing = false;
+      if (this.inflightSync === run) {
+        this.inflightSync = undefined;
+      }
     }
   }
 
-  /** 检查到期提醒并推送事件。 */
+  private async runSyncNow(): Promise<{ events: CalendarEvent[]; reports: SyncSourceReport[] }> {
+    const now = this.now();
+    this.lastAttemptAt = now;
+    const lookaheadDays = Number.isFinite(this.opts.cfg.lookaheadDays)
+      ? Math.max(1, Math.min(30, Math.round(this.opts.cfg.lookaheadDays)))
+      : 7;
+    // 回看 1 天以覆盖跨天或正在进行中的区间日程
+    const windowStartMs = now - 24 * 60 * 60_000;
+    const windowEndMs = now + lookaheadDays * 24 * 60 * 60_000;
+
+    const { file } = readStore(this.opts.dataDir);
+    let events: CalendarEvent[];
+    let calendars: DiscoveredCalendar[];
+    let reports: SyncSourceReport[];
+    let anyError = false;
+    const currentCaldavUrl = normalizeCaldavUrl(this.opts.cfg.caldavUrl);
+    const currentCaldavUsername = this.opts.cfg.caldavUsername.trim();
+    let caldavSucceeded = false;
+
+    if (this.opts.syncSources) {
+      const res = await this.opts.syncSources(windowStartMs, windowEndMs);
+      reports = res.reports;
+      anyError = reports.some((r) => Boolean(r.error));
+      if (anyError) {
+        events = file.events;
+        calendars = file.calendars;
+      } else {
+        events = res.events;
+        calendars = res.calendars ?? [];
+        caldavSucceeded = Boolean(currentCaldavUrl);
+      }
+    } else {
+      const [sysRes, caldavRes] = await Promise.all([
+        syncSystemCalendars({
+          systemCalendarEnabled: this.opts.cfg.systemCalendarEnabled,
+          localIcsPaths: this.opts.cfg.localIcsPaths,
+          windowStartMs,
+          windowEndMs,
+          defaultTimezone: this.opts.timezone,
+        }),
+        syncCaldavAndSubscriptions({
+          urlsRaw: this.opts.cfg.caldavUrl,
+          username: this.opts.cfg.caldavUsername,
+          password: this.opts.cfg.caldavPassword,
+          windowStartMs,
+          windowEndMs,
+          defaultTimezone: this.opts.timezone,
+        }),
+      ]);
+      const sysFailed = sysRes.reports.some((r) => Boolean(r.error));
+      const caldavFailed = caldavRes.reports.some((r) => Boolean(r.error));
+      anyError = sysFailed || caldavFailed;
+      caldavSucceeded = !caldavFailed && Boolean(currentCaldavUrl);
+      const caldavChanged = (file.lastCaldavUrl !== undefined && file.lastCaldavUrl !== currentCaldavUrl)
+        || (file.lastCaldavUsername !== undefined && file.lastCaldavUsername !== currentCaldavUsername);
+
+      const keptSysEvents = sysFailed ? file.events.filter((e) => e.source === 'system') : sysRes.events;
+      const keptSysCals = sysFailed ? file.calendars.filter((c) => c.source === 'system') : sysRes.calendars;
+      const keptCaldavEvents = (caldavFailed && !caldavChanged && currentCaldavUrl)
+        ? file.events.filter((e) => e.source === 'caldav' || e.source === 'ics')
+        : caldavRes.events;
+      const keptCaldavCals = (caldavFailed && !caldavChanged && currentCaldavUrl)
+        ? file.calendars.filter((c) => c.source === 'caldav' || c.source === 'ics')
+        : caldavRes.calendars;
+
+      const dedup = new Map<string, CalendarEvent>();
+      for (const ev of [...keptSysEvents, ...keptCaldavEvents]) dedup.set(ev.key, ev);
+      events = [...dedup.values()].sort((a, b) => a.startMs - b.startMs);
+
+      const calDedup = new Map<string, DiscoveredCalendar>();
+      for (const c of [...keptSysCals, ...keptCaldavCals]) calDedup.set(c.id, c);
+      calendars = [...calDedup.values()];
+      reports = [...sysRes.reports, ...caldavRes.reports];
+    }
+
+    this.lastAttemptFailed = anyError;
+    this.lastReports = reports;
+    for (const rep of reports) {
+      if (rep.error) {
+        this.host?.log.warn(`日历源同步异常 [${rep.source}]: ${rep.error}`);
+      }
+    }
+
+    // 迁移 1.1.0 旧版 system:<name>（含分组 ID）到新的稳定 ID（支持相对路径与 ~/ 解析）
+    const home = homedir();
+    const customPathPrefixes = splitPathList(this.opts.cfg.localIcsPaths).map((p) => (
+      (p.startsWith('~/') ? join(home, p.slice(2)) : resolve(p)).replace(/\/+$/, '')
+    ));
+    const isCustomLocalCal = (calId: string) => customPathPrefixes.some((clean) => (
+      calId === `system:file:${clean}`
+      || calId === `system:dir:${clean}`
+      || calId.startsWith(`system:file:${clean}/`)
+    ));
+    const migrateIds = (ids: string[] | undefined): { next: string[]; changed: boolean } => {
+      if (!ids || ids.length === 0) return { next: [], changed: false };
+      let changed = false;
+      const out = new Set<string>();
+      for (const id of ids) {
+        if (id.startsWith('system:')
+          && !id.startsWith('system:file:')
+          && !id.startsWith('system:dir:')
+          && !id.startsWith('system:mac:')
+          && !id.startsWith('system:outlook:')
+          && !id.startsWith('system:winrt:')) {
+          const legacyName = id.slice('system:'.length);
+          let matches: DiscoveredCalendar[] = [];
+          if (legacyName === '本地 ICS') {
+            matches = calendars.filter((c) => c.source === 'system' && isCustomLocalCal(c.id));
+          } else if (legacyName === 'Linux 系统日历') {
+            matches = calendars.filter((c) => c.source === 'system' && !isCustomLocalCal(c.id));
+          } else {
+            matches = calendars.filter((c) => c.source === 'system' && c.name === legacyName);
+          }
+          if (matches.length > 0) {
+            for (const m of matches) out.add(m.id);
+            changed = true;
+            continue;
+          }
+        }
+        out.add(id);
+      }
+      return { next: [...out], changed };
+    };
+    const migratedDisabled = migrateIds(this.opts.cfg.disabledCalendars);
+    const migratedWritable = migrateIds(this.opts.cfg.writableCalendars);
+    if (migratedDisabled.changed || migratedWritable.changed) {
+      if (migratedDisabled.changed) this.opts.cfg.disabledCalendars = migratedDisabled.next;
+      if (migratedWritable.changed) this.opts.cfg.writableCalendars = migratedWritable.next;
+      this.opts.persist?.({
+        ...(migratedDisabled.changed ? { disabledCalendars: migratedDisabled.next } : {}),
+        ...(migratedWritable.changed ? { writableCalendars: migratedWritable.next } : {}),
+      });
+    }
+
+    // 仅在 storeLock 内重读最新 states 并合并，避免覆盖并发投递的提醒状态；旧版事件状态键仅消费一次
+    await this.withStoreLock(() => {
+      const latest = readStore(this.opts.dataDir).file;
+      for (const ev of events) {
+        if (!latest.states[ev.key]) {
+          const legacyKey = `${ev.source}:${ev.uid}:${ev.startMs}`;
+          if (latest.states[legacyKey]) {
+            latest.states[ev.key] = { ...latest.states[legacyKey]! };
+            delete latest.states[legacyKey];
+          }
+        }
+      }
+      latest.events = events;
+      latest.calendars = calendars;
+      if (caldavSucceeded) {
+        latest.lastCaldavUrl = currentCaldavUrl;
+        latest.lastCaldavUsername = currentCaldavUsername;
+      } else if (!currentCaldavUrl) {
+        delete latest.lastCaldavUrl;
+        delete latest.lastCaldavUsername;
+      }
+      if (!anyError) {
+        latest.lastSyncAt = now;
+      }
+      pruneStates(latest, now);
+      writeStore(this.opts.dataDir, latest);
+    });
+    return { events, reports };
+  }
+
+  /** 检查到期提醒并逐条推送；串行化执行，仅在单条投递成功后才落盘。 */
   async checkAndPushDue(): Promise<DueNotification[]> {
+    const run = this.dueQueue.then(() => this.runCheckAndPushDue(), () => this.runCheckAndPushDue());
+    this.dueQueue = run.catch(() => []);
+    return run;
+  }
+
+  private async runCheckAndPushDue(): Promise<DueNotification[]> {
     const host = this.host;
     if (!host) return [];
     const now = this.now();
-    const { file } = readStore(this.opts.dataDir);
-    const due = evaluateDueNotifications(file, now, {
-      intervalMode: this.opts.cfg.intervalMode,
-      notifyOnEnd: this.opts.cfg.notifyOnEnd,
-      disabledCalendars: this.opts.cfg.disabledCalendars,
+    const due = await this.withStoreLock(() => {
+      const { file } = readStore(this.opts.dataDir);
+      return evaluateDueNotifications(file, now, {
+        intervalMode: this.opts.cfg.intervalMode,
+        notifyOnEnd: this.opts.cfg.notifyOnEnd,
+        disabledCalendars: this.opts.cfg.disabledCalendars,
+      });
     });
     if (due.length === 0) return [];
 
-    applyNotifications(file, due, now);
-    writeStore(this.opts.dataDir, file);
-
+    const delivered: DueNotification[] = [];
     const pushOpts: PushOptions = { trigger: this.opts.cfg.trigger };
     for (const item of due) {
       const { event } = item;
@@ -456,57 +590,67 @@ export class CalendarReminderWorld implements World {
       const locationPart = event.location ? `，地点：${event.location}` : '';
       const sourcePart = event.calendarName ? ` [${event.calendarName}]` : '';
 
-      if (item.kind === 'interval_end') {
-        await host.pushEvent(
-          {
-            type: 'calendar.ended',
-            ts: nowIso(this.opts.timezone),
-            source: this.id,
-            origin: 'internal',
-            senderKey: this.id,
-            text: `区间日程时间到了（已结束）：「${clip(event.title)}」（${timeRange}${locationPart}）${sourcePart}。`,
-            meta: {
-              eventKey: event.key,
-              uid: event.uid,
-              kind: item.kind,
-              startMs: event.startMs,
-              endMs: event.endMs,
+      try {
+        if (item.kind === 'interval_end') {
+          await host.pushEvent(
+            {
+              type: 'calendar.ended',
+              ts: nowIso(this.opts.timezone),
+              source: this.id,
+              origin: 'internal',
+              senderKey: this.id,
+              text: `区间日程时间到了（已结束）：「${clip(event.title)}」（${timeRange}${locationPart}）${sourcePart}。`,
+              meta: {
+                eventKey: event.key,
+                uid: event.uid,
+                kind: item.kind,
+                startMs: event.startMs,
+                endMs: event.endMs,
+              },
             },
-          },
-          pushOpts,
-        );
-      } else {
-        const prefix = item.kind === 'point'
-          ? '日程提醒'
-          : item.kind === 'interval_start'
-            ? '区间日程开始'
-            : `区间日程持续提醒（第 ${item.firedCount} 次）`;
-        const hint = isIntervalEvent(event) && this.opts.cfg.intervalMode !== 'once'
-          ? '；如需停止本条区间重复提醒可调用 calendar_ack。'
-          : '。';
-        await host.pushEvent(
-          {
-            type: 'calendar.due',
-            ts: nowIso(this.opts.timezone),
-            source: this.id,
-            origin: 'internal',
-            senderKey: this.id,
-            text: `${prefix}：「${clip(event.title)}」（${timeRange}${locationPart}）${sourcePart}${hint}`,
-            meta: {
-              eventKey: event.key,
-              uid: event.uid,
-              kind: item.kind,
-              firedCount: item.firedCount,
-              startMs: event.startMs,
-              endMs: event.endMs,
+            pushOpts,
+          );
+        } else {
+          const prefix = item.kind === 'point'
+            ? '日程提醒'
+            : item.kind === 'interval_start'
+              ? '区间日程开始'
+              : `区间日程持续提醒（第 ${item.firedCount} 次）`;
+          const hint = isIntervalEvent(event) && this.opts.cfg.intervalMode !== 'once'
+            ? '；如需停止本条区间重复提醒可调用 calendar_ack。'
+            : '。';
+          await host.pushEvent(
+            {
+              type: 'calendar.due',
+              ts: nowIso(this.opts.timezone),
+              source: this.id,
+              origin: 'internal',
+              senderKey: this.id,
+              text: `${prefix}：「${clip(event.title)}」（${timeRange}${locationPart}）${sourcePart}${hint}`,
+              meta: {
+                eventKey: event.key,
+                uid: event.uid,
+                kind: item.kind,
+                firedCount: item.firedCount,
+                startMs: event.startMs,
+                endMs: event.endMs,
+              },
             },
-          },
-          pushOpts,
-        );
+            pushOpts,
+          );
+        }
+        await this.withStoreLock(() => {
+          const latest = readStore(this.opts.dataDir).file;
+          applyNotifications(latest, [item], now);
+          writeStore(this.opts.dataDir, latest);
+        });
+        delivered.push(item);
+      } catch (error) {
+        host.log.warn(`日历提醒投递失败（将在下轮重试）[${clip(event.title)}]: ${describeError(error)}`);
       }
     }
 
-    return due;
+    return delivered;
   }
 
   private listTool(): ToolDef {
@@ -557,10 +701,13 @@ export class CalendarReminderWorld implements World {
       handler: async (args) => {
         const query = typeof args.event === 'string' ? args.event.trim() : '';
         if (!query) return '请提供要静默的日程 key、uid 或标题关键词。';
-        const { file } = readStore(this.opts.dataDir);
-        const matched = ackEvent(file, query);
+        const matched = await this.withStoreLock(() => {
+          const { file } = readStore(this.opts.dataDir);
+          const hit = ackEvent(file, query);
+          if (hit) writeStore(this.opts.dataDir, file);
+          return hit;
+        });
         if (!matched) return `未找到匹配的日程「${query}」，可用 calendar_list 查看。`;
-        writeStore(this.opts.dataDir, file);
         return `已静默日程「${clip(matched.title)}」(${formatEventTime(matched.startMs, matched.endMs, this.opts.timezone)}) 的后续区间重复提醒。`;
       },
     };
@@ -596,6 +743,11 @@ export class CalendarReminderWorld implements World {
           endMs = parsedEnd;
         }
 
+        // 写入前按当前配置刷新并校验目标日历是否仍然存在且可写
+        if (!this.opts.syncSources) {
+          await this.syncNow().catch(() => undefined);
+        }
+
         const eventInput: NewIcsEventInput = {
           uid: `coopanion-${randomUUID()}`,
           title,
@@ -608,28 +760,44 @@ export class CalendarReminderWorld implements World {
         };
 
         const { file } = readStore(this.opts.dataDir);
-        const nameMap = new Map(file.calendars.map((c) => [c.id, c.name]));
+        const calMap = new Map(file.calendars.map((c) => [c.id, c]));
         const okList: string[] = [];
         const errList: string[] = [];
 
         for (const calId of targets) {
-          const label = nameMap.get(calId) ?? calId;
+          const discovered = calMap.get(calId);
+          const label = discovered?.name ?? calId;
           try {
-            if (this.opts.writeEvent) {
-              await this.opts.writeEvent(calId, eventInput);
-            } else if (calId.startsWith('caldav:')) {
-              await writeCaldavEvent({
-                calendarId: calId,
-                username: this.opts.cfg.caldavUsername,
-                password: this.opts.cfg.caldavPassword,
-                event: eventInput,
-              });
+            if (!discovered || discovered.writable === false) {
+              throw new Error('该日历已从当前配置移除或不支持写入');
+            }
+            if (calId.startsWith('caldav:')) {
+              const configured = normalizeCaldavUrl(this.opts.cfg.caldavUrl);
+              if (!configured) {
+                throw new Error('CalDAV 地址已清空');
+              }
+              if (file.lastCaldavUrl !== configured || (file.lastCaldavUsername ?? '') !== this.opts.cfg.caldavUsername.trim()) {
+                throw new Error('CalDAV 配置或账号已变更，请重新同步并勾选当前账号下的日历');
+              }
+              if (this.opts.writeEvent) {
+                await this.opts.writeEvent(calId, eventInput);
+              } else {
+                await writeCaldavEvent({
+                  calendarId: calId,
+                  username: this.opts.cfg.caldavUsername,
+                  password: this.opts.cfg.caldavPassword,
+                  event: eventInput,
+                });
+              }
             } else if (calId.startsWith('system:')) {
-              await writeSystemCalendarEvent({
-                calendarId: calId,
-                localIcsPaths: this.opts.cfg.localIcsPaths,
-                event: eventInput,
-              });
+              if (this.opts.writeEvent) {
+                await this.opts.writeEvent(calId, eventInput);
+              } else {
+                await writeSystemCalendarEvent({
+                  calendarId: calId,
+                  event: eventInput,
+                });
+              }
             } else {
               throw new Error('只读日历不支持写入');
             }

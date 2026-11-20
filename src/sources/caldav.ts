@@ -141,12 +141,37 @@ function escapeXmlText(text: string): string {
     .replace(/>/g, '&gt;');
 }
 
+function findMultistatusError(xml: string, allowMissingCalendarData: boolean): number | undefined {
+  const responses = xml.split(/<(?:[a-zA-Z0-9_-]+:)?response\b/i).slice(1);
+  const statusRe = /<(?:[a-zA-Z0-9_-]+:)?status\b[^>]*>HTTP\/\d+(?:\.\d+)?\s+(\d{3})\b[^<]*<\/(?:[a-zA-Z0-9_-]+:)?status>/i;
+  for (const resp of responses) {
+    const propstats = resp.split(/<(?:[a-zA-Z0-9_-]+:)?propstat\b/i).slice(1);
+    if (propstats.length === 0) {
+      const m = statusRe.exec(resp);
+      if (m && Number(m[1]) >= 400) return Number(m[1]);
+      continue;
+    }
+    for (const ps of propstats) {
+      const m = statusRe.exec(ps);
+      if (!m) continue;
+      const code = Number(m[1]);
+      if (code < 400) continue;
+      // 飞书等两步 CalDAV 在 calendar-query 中会对 <C:calendar-data/> 返回 404，属正常情况
+      if (allowMissingCalendarData && code === 404 && /<(?:[a-zA-Z0-9_-]+:)?calendar-data\b/i.test(ps)) {
+        continue;
+      }
+      return code;
+    }
+  }
+  return undefined;
+}
+
 async function multigetCalendarData(
   collectionUrl: string,
   hrefs: string[],
   authHeader: string | undefined,
   fetchFn: typeof fetch,
-): Promise<string[]> {
+): Promise<{ ok: boolean; status: number; blocks: string[] }> {
   const blocks: string[] = [];
   const chunkSize = 50;
   for (let i = 0; i < hrefs.length; i += chunkSize) {
@@ -171,11 +196,17 @@ ${hrefXml}
       body,
       signal: AbortSignal.timeout(15_000),
     });
-    if (res.ok) {
-      blocks.push(...extractCalendarDataFromXml(await res.text()));
+    if (!res.ok) {
+      return { ok: false, status: res.status, blocks: [] };
     }
+    const xml = await res.text();
+    const errCode = findMultistatusError(xml, false);
+    if (errCode !== undefined) {
+      return { ok: false, status: errCode, blocks: [] };
+    }
+    blocks.push(...extractCalendarDataFromXml(xml));
   }
-  return blocks;
+  return { ok: true, status: 207, blocks };
 }
 
 async function queryCalendarReport(
@@ -217,15 +248,36 @@ async function queryCalendarReport(
     return { ok: false, status: res.status, icsBlocks: [] };
   }
   const text = await res.text();
-  const directBlocks = extractCalendarDataFromXml(text);
+  const queryErr = findMultistatusError(text, true);
+  if (queryErr !== undefined) {
+    return { ok: false, status: queryErr, icsBlocks: [] };
+  }
+  const responses = text.split(/<(?:[a-zA-Z0-9_-]+:)?response\b/i).slice(1);
+  const directBlocks: string[] = [];
+  const missingHrefs: string[] = [];
+  for (const resp of responses) {
+    const blocks = extractCalendarDataFromXml(resp);
+    if (blocks.length > 0) {
+      directBlocks.push(...blocks);
+    } else {
+      missingHrefs.push(...extractResourceHrefsFromXml(`<D:response${resp}`));
+    }
+  }
+  const uniqueMissing = [...new Set(missingHrefs)];
+  if (uniqueMissing.length > 0) {
+    const multiget = await multigetCalendarData(url, uniqueMissing, authHeader, fetchFn);
+    if (!multiget.ok) {
+      return { ok: false, status: multiget.status, icsBlocks: [] };
+    }
+    return { ok: true, status: res.status, icsBlocks: [...directBlocks, ...multiget.blocks] };
+  }
   if (directBlocks.length > 0) {
     return { ok: true, status: res.status, icsBlocks: directBlocks };
   }
-  // 兼容飞书等 CalDAV：calendar-query 只返回 .ics href，需再通过 calendar-multiget 拉取正文
-  const hrefs = extractResourceHrefsFromXml(text);
-  if (hrefs.length > 0) {
-    const multigetBlocks = await multigetCalendarData(url, hrefs, authHeader, fetchFn);
-    return { ok: true, status: res.status, icsBlocks: multigetBlocks };
+  // 兜底：若服务端未按 <response> 分段直接内联返回 <calendar-data>
+  const fallbackBlocks = extractCalendarDataFromXml(text);
+  if (fallbackBlocks.length > 0) {
+    return { ok: true, status: res.status, icsBlocks: fallbackBlocks };
   }
   return { ok: true, status: res.status, icsBlocks: [] };
 }
@@ -376,23 +428,26 @@ export async function syncCaldavAndSubscriptions(opts: CaldavSyncOptions): Promi
     if (collections.length > 0) {
       const events: CalendarEvent[] = [];
       const calendars: DiscoveredCalendar[] = [];
+      const errors: string[] = [];
       for (const col of collections) {
         const rep = await queryCalendarReport(col.url, authHeader, opts, fetchFn);
+        if (!rep.ok) {
+          errors.push(`${col.name}: HTTP ${rep.status}`);
+          continue;
+        }
         let colCount = 0;
-        if (rep.ok) {
-          const calId = `caldav:${col.url}`;
-          for (const ics of rep.icsBlocks) {
-            const parsed = parseIcs(ics, {
-              windowStartMs: opts.windowStartMs,
-              windowEndMs: opts.windowEndMs,
-              defaultTimezone: opts.defaultTimezone,
-              source: 'caldav',
-              calendarId: calId,
-              calendarName: col.name,
-            });
-            colCount += parsed.length;
-            events.push(...parsed);
-          }
+        const calId = `caldav:${col.url}`;
+        for (const ics of rep.icsBlocks) {
+          const parsed = parseIcs(ics, {
+            windowStartMs: opts.windowStartMs,
+            windowEndMs: opts.windowEndMs,
+            defaultTimezone: opts.defaultTimezone,
+            source: 'caldav',
+            calendarId: calId,
+            calendarName: col.name,
+          });
+          colCount += parsed.length;
+          events.push(...parsed);
         }
         calendars.push({ id: `caldav:${col.url}`, name: col.name, source: 'caldav', count: colCount, writable: true });
       }
@@ -401,11 +456,25 @@ export async function syncCaldavAndSubscriptions(opts: CaldavSyncOptions): Promi
       return {
         events: [...dedup.values()],
         calendars,
-        reports: [{ source: url, count: dedup.size }],
+        reports: [{
+          source: url,
+          count: dedup.size,
+          ...(errors.length > 0 ? { error: errors.join('；') } : {}),
+        }],
       };
     }
 
-    // 4) 回退：尝试 GET 作为普通 ICS 订阅
+    // 4) 若直接 REPORT 已成功（200/207）但无子集合且 0 条日程，说明该 URL 本身就是空的 CalDAV 日历集合
+    if (direct.ok) {
+      const calId = `caldav:${url}`;
+      return {
+        events: [],
+        calendars: [{ id: calId, name: 'CalDAV', source: 'caldav', count: 0, writable: true }],
+        reports: [{ source: url, count: 0 }],
+      };
+    }
+
+    // 5) 回退：尝试 GET 作为普通 ICS 订阅
     const headers: Record<string, string> = {};
     if (authHeader) headers.Authorization = authHeader;
     const getRes = await fetchFn(url, { headers, signal: AbortSignal.timeout(15_000) });
@@ -463,8 +532,10 @@ export async function writeCaldavEvent(opts: {
   if (!opts.calendarId.startsWith('caldav:')) {
     throw new Error('该日历不是可写的 CalDAV 日历');
   }
-  const collectionUrl = opts.calendarId.slice('caldav:'.length).replace(/\/?$/, '/');
-  const targetUrl = `${collectionUrl}${encodeURIComponent(opts.event.uid)}.ics`;
+  const collectionUrl = opts.calendarId.slice('caldav:'.length);
+  const parsedUrl = new URL(collectionUrl);
+  parsedUrl.pathname = `${parsedUrl.pathname.replace(/\/?$/, '/')}${encodeURIComponent(opts.event.uid)}.ics`;
+  const targetUrl = parsedUrl.toString();
   const fetchFn = opts.fetchImpl ?? fetch;
   const authHeader = buildAuthHeader(opts.username, opts.password);
   const headers: Record<string, string> = {

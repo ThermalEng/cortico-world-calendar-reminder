@@ -309,6 +309,7 @@ interface RawVEvent {
   status?: string;
   dtstart?: ParsedDate;
   dtend?: ParsedDate;
+  recurrenceId?: ParsedDate;
   durationMs?: number;
   rrule?: string;
   exdates: number[];
@@ -379,6 +380,9 @@ export function parseIcs(icsText: string, opts: ParseIcsOptions): CalendarEvent[
       case 'DTEND':
         current.dtend = parseIcsDate(prop.value, prop.params, opts.defaultTimezone);
         break;
+      case 'RECURRENCE-ID':
+        current.recurrenceId = parseIcsDate(prop.value, prop.params, opts.defaultTimezone);
+        break;
       case 'DURATION':
         current.durationMs = parseIcsDurationMs(prop.value);
         break;
@@ -400,6 +404,19 @@ export function parseIcs(icsText: string, opts: ParseIcsOptions): CalendarEvent[
     }
   }
 
+  // 收集每个 UID 被 RECURRENCE-ID 覆盖或取消的原始实例时刻
+  const overriddenByUid = new Map<string, Set<number>>();
+  for (const raw of rawEvents) {
+    if (raw.uid && raw.recurrenceId) {
+      let set = overriddenByUid.get(raw.uid);
+      if (!set) {
+        set = new Set<number>();
+        overriddenByUid.set(raw.uid, set);
+      }
+      set.add(raw.recurrenceId.ms);
+    }
+  }
+
   const events: CalendarEvent[] = [];
   for (let i = 0; i < rawEvents.length; i++) {
     const raw = rawEvents[i]!;
@@ -409,13 +426,41 @@ export function parseIcs(icsText: string, opts: ParseIcsOptions): CalendarEvent[
     const uid = raw.uid || `anon-${i}-${raw.dtstart.ms}`;
 
     let durationMs = 0;
+    let allDaySpanDays: number | undefined;
     if (raw.dtend) {
       durationMs = Math.max(0, raw.dtend.ms - raw.dtstart.ms);
+      if (raw.dtstart.allDay && raw.dtend.allDay && durationMs > 0) {
+        allDaySpanDays = Math.max(1, Math.round(durationMs / 86_400_000));
+      }
     } else if (raw.durationMs !== undefined) {
       durationMs = Math.max(0, raw.durationMs);
+    } else if (raw.dtstart.allDay) {
+      allDaySpanDays = 1;
+      durationMs = 24 * 60 * 60_000;
     }
 
+    const tzid = raw.dtstart.tzid ?? resolveTimezone(undefined, opts.defaultTimezone);
+    const computeEndMs = (occStartMs: number): number => {
+      if (allDaySpanDays === undefined) return occStartMs + durationMs;
+      const comp = getZonedComponents(occStartMs, tzid);
+      const endDate = new Date(Date.UTC(comp.year, comp.month - 1, comp.day + allDaySpanDays));
+      const endMidnight = zonedToEpochMs(
+        endDate.getUTCFullYear(),
+        endDate.getUTCMonth() + 1,
+        endDate.getUTCDate(),
+        0, 0, 0,
+        tzid,
+      );
+      return Math.max(occStartMs, endMidnight);
+    };
+
     const exdateSet = new Set(raw.exdates);
+    if (!raw.recurrenceId && raw.uid) {
+      const overridden = overriddenByUid.get(raw.uid);
+      if (overridden) {
+        for (const ms of overridden) exdateSet.add(ms);
+      }
+    }
     const occurrences = new Set<number>();
 
     if (raw.rrule) {
@@ -444,13 +489,14 @@ export function parseIcs(icsText: string, opts: ParseIcsOptions): CalendarEvent[
       if (!exdateSet.has(rdate)) occurrences.add(rdate);
     }
 
+    const calId = opts.calendarId ?? `${opts.source}:${calendarName ?? 'default'}`;
     for (const startMs of occurrences) {
-      const endMs = startMs + durationMs;
+      const endMs = computeEndMs(startMs);
       if (endMs < opts.windowStartMs || startMs > opts.windowEndMs) continue;
       events.push({
-        key: `${opts.source}:${uid}:${startMs}`,
+        key: `${calId}:${uid}:${startMs}`,
         uid,
-        calendarId: opts.calendarId ?? `${opts.source}:${calendarName ?? 'default'}`,
+        calendarId: calId,
         title,
         description: raw.description,
         location: raw.location,

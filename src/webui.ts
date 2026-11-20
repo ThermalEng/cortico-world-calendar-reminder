@@ -57,6 +57,7 @@ const panel: WebUiPanel = {
     ctx.root.append(sheet.el);
 
     let busy = false;
+    let lastState: CalendarPanelState | undefined;
 
     function makeCheck(labelText: string, checked: boolean, disabled: boolean, title: string, onChange: (v: boolean) => void) {
       const lbl = document.createElement('label');
@@ -73,6 +74,7 @@ const panel: WebUiPanel = {
     }
 
     function render(state: CalendarPanelState) {
+      lastState = state;
       if (ctx.signal.aborted) return;
       statusPill.textContent = state.lastSyncText;
       statusPill.className = `pill ${state.errors.length > 0 ? 'off' : 'on'}`;
@@ -111,13 +113,14 @@ const panel: WebUiPanel = {
     async function invokeMethod(method: string, args: unknown[]) {
       if (busy) return;
       busy = true;
+      if (lastState) render(lastState);
       try {
-        const state = await ctx.invoke<CalendarPanelState>(method, args);
-        render(state);
+        lastState = await ctx.invoke<CalendarPanelState>(method, args);
       } catch (error) {
         if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
       } finally {
         busy = false;
+        if (lastState) render(lastState);
       }
     }
 
@@ -126,11 +129,11 @@ const panel: WebUiPanel = {
       busy = true;
       syncBtn.disabled = true;
       syncBtn.textContent = t.syncing;
+      if (lastState) render(lastState);
       try {
-        const state = await ctx.invoke<CalendarPanelState>('sync');
-        render(state);
+        lastState = await ctx.invoke<CalendarPanelState>('sync');
         if (!ctx.signal.aborted) {
-          ui.toast(t.syncDone, state.errors.length > 0 ? 'bad' : 'ok');
+          ui.toast(t.syncDone, lastState.errors.length > 0 ? 'bad' : 'ok');
         }
       } catch (error) {
         if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
@@ -138,6 +141,7 @@ const panel: WebUiPanel = {
         busy = false;
         syncBtn.disabled = false;
         syncBtn.textContent = t.syncBtn;
+        if (lastState) render(lastState);
       }
     }
 

@@ -26,6 +26,8 @@ export interface EventNotifyState {
 export interface CalendarStoreFile {
   version: 1;
   lastSyncAt?: number;
+  lastCaldavUrl?: string;
+  lastCaldavUsername?: string;
   calendars: DiscoveredCalendar[];
   events: CalendarEvent[];
   states: Record<string, EventNotifyState>;
@@ -59,6 +61,8 @@ export function readStore(dataDir: string): { file: CalendarStoreFile; recovered
       file: {
         version: 1,
         lastSyncAt: typeof raw.lastSyncAt === 'number' ? raw.lastSyncAt : undefined,
+        lastCaldavUrl: typeof raw.lastCaldavUrl === 'string' ? raw.lastCaldavUrl : undefined,
+        lastCaldavUsername: typeof raw.lastCaldavUsername === 'string' ? raw.lastCaldavUsername : undefined,
         calendars: Array.isArray(raw.calendars) ? raw.calendars : [],
         events: raw.events,
         states: raw.states,
