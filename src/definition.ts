@@ -26,6 +26,10 @@ export const CALENDAR_REMINDER: WorldDefinition<CalendarReminderConfigSection> =
         zh: '静默指定区间日程的后续重复提醒。',
         en: 'Mute further interval reminders for a specific calendar event.',
       },
+      calendar_add: {
+        zh: '向已勾选的可写日历写入一条新日程（仅在用户明确要求写入日历/日程时使用，普通提醒请用闹钟）。',
+        en: 'Write a new event to selected writable calendar(s) (use only when explicitly asked for a calendar/schedule event).',
+      },
     }),
     events: [
       {

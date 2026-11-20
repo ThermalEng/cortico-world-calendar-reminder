@@ -4,12 +4,14 @@
  * - 每 15 秒扫描一次到期日程与区间提醒
  * - 点任务提醒一次；区间任务按配置（once/daily/hourly/every_15m）提醒，并可选在结束时提醒「时间到了」
  */
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import type { PushOptions, ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import { CALENDAR_REMINDER_CONFIG_GROUP, type CalendarReminderConfigSection, type IntervalRemindMode } from './config.ts';
-import { syncCaldavAndSubscriptions } from './sources/caldav.ts';
-import { syncSystemCalendars } from './sources/system.ts';
+import type { NewIcsEventInput } from './ics.ts';
+import { syncCaldavAndSubscriptions, writeCaldavEvent } from './sources/caldav.ts';
+import { syncSystemCalendars, writeSystemCalendarEvent } from './sources/system.ts';
 import { isIntervalEvent, type CalendarEvent, type DiscoveredCalendar, type SyncSourceReport } from './sources/types.ts';
 import type { CalendarPanelItem, CalendarPanelState } from './webui.ts';
 import {
@@ -42,6 +44,8 @@ export interface CalendarReminderWorldOptions {
     calendars?: DiscoveredCalendar[];
     reports: SyncSourceReport[];
   }>;
+  /** 可选注入，用于测试写入日历。 */
+  writeEvent?: (calendarId: string, event: NewIcsEventInput) => Promise<void>;
 }
 
 export const CALENDAR_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
@@ -84,6 +88,42 @@ export const CALENDAR_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
         },
       },
       required: ['event'],
+    },
+  },
+  {
+    name: 'calendar_add',
+    description: 'Create a new calendar event in the user-selected writable calendar(s). Use ONLY when the user explicitly asks to add to a calendar or schedule a calendar event (NOT for general alarms/reminders).',
+    tags: ['write'],
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title/summary of the calendar event.',
+        },
+        start: {
+          type: 'string',
+          description: 'Start time in ISO 8601 with timezone offset, e.g. 2026-11-21T14:00:00+08:00.',
+        },
+        end: {
+          type: 'string',
+          description: 'Optional end time in ISO 8601 with timezone offset; omit for a point event.',
+        },
+        location: {
+          type: 'string',
+          description: 'Optional event location.',
+        },
+        description: {
+          type: 'string',
+          description: 'Optional event notes or description.',
+        },
+        all_day: {
+          type: 'boolean',
+          description: 'Whether this is an all-day event.',
+        },
+      },
+      required: ['title', 'start'],
     },
   },
 ];
@@ -154,16 +194,23 @@ export class CalendarReminderWorld implements World {
       this.listTool(),
       this.syncTool(),
       this.ackTool(),
+      this.addTool(),
     ];
   }
 
   private buildPanelState(): CalendarPanelState {
     const { file } = readStore(this.opts.dataDir);
     const disabled = new Set(this.opts.cfg.disabledCalendars ?? []);
-    const calendars: CalendarPanelItem[] = file.calendars.map((c) => ({
-      ...c,
-      enabled: !disabled.has(c.id),
-    }));
+    const writableSet = new Set(this.opts.cfg.writableCalendars ?? []);
+    const calendars: CalendarPanelItem[] = file.calendars.map((c) => {
+      const canWrite = c.writable ?? (c.source !== 'ics');
+      return {
+        ...c,
+        enabled: !disabled.has(c.id),
+        writable: canWrite,
+        allowWrite: canWrite && writableSet.has(c.id),
+      };
+    });
     const lastSyncText = file.lastSyncAt
       ? `上次同步：${formatLocal(file.lastSyncAt, this.opts.timezone)}`
       : '尚未同步';
@@ -217,6 +264,18 @@ export class CalendarReminderWorld implements World {
           const disabledCalendars = [...next];
           this.opts.cfg.disabledCalendars = disabledCalendars;
           this.opts.persist?.({ disabledCalendars });
+          return this.buildPanelState();
+        }
+        if (method === 'toggleWrite') {
+          const calId = typeof args[0] === 'string' ? args[0] : '';
+          const allowWrite = Boolean(args[1]);
+          if (!calId) throw new Error('Missing calendar id');
+          const next = new Set(this.opts.cfg.writableCalendars ?? []);
+          if (allowWrite) next.add(calId);
+          else next.delete(calId);
+          const writableCalendars = [...next];
+          this.opts.cfg.writableCalendars = writableCalendars;
+          this.opts.persist?.({ writableCalendars });
           return this.buildPanelState();
         }
         throw new Error(`Unknown method: ${method}`);
@@ -503,6 +562,94 @@ export class CalendarReminderWorld implements World {
         if (!matched) return `未找到匹配的日程「${query}」，可用 calendar_list 查看。`;
         writeStore(this.opts.dataDir, file);
         return `已静默日程「${clip(matched.title)}」(${formatEventTime(matched.startMs, matched.endMs, this.opts.timezone)}) 的后续区间重复提醒。`;
+      },
+    };
+  }
+
+  private addTool(): ToolDef {
+    return {
+      ...CALENDAR_TOOL_DECLS[3]!,
+      handler: async (args) => {
+        const targets = this.opts.cfg.writableCalendars ?? [];
+        if (targets.length === 0) {
+          return '未写入：尚未勾选任何可写入的目标日历，请先在日历提醒的「日历选择与同步」面板中勾选「写入」复选框。';
+        }
+        const title = typeof args.title === 'string' ? args.title.trim() : '';
+        if (!title) return '未写入：日程标题不能为空。';
+
+        const startRaw = typeof args.start === 'string' ? args.start.trim() : '';
+        if (!startRaw || !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/.test(startRaw)) {
+          return '未写入：start 必须是带时区偏移的 ISO 8601 时间，例如 2026-11-21T14:00:00+08:00。';
+        }
+        const startMs = Date.parse(startRaw);
+        if (!Number.isFinite(startMs)) return `未写入：start 不是合法时间（${startRaw}）。`;
+
+        let endMs = startMs;
+        if (typeof args.end === 'string' && args.end.trim()) {
+          const endRaw = args.end.trim();
+          if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/.test(endRaw)) {
+            return '未写入：end 必须是带时区偏移的 ISO 8601 时间，例如 2026-11-21T15:00:00+08:00。';
+          }
+          const parsedEnd = Date.parse(endRaw);
+          if (!Number.isFinite(parsedEnd)) return `未写入：end 不是合法时间（${endRaw}）。`;
+          if (parsedEnd < startMs) return '未写入：结束时间不能早于开始时间。';
+          endMs = parsedEnd;
+        }
+
+        const eventInput: NewIcsEventInput = {
+          uid: `coopanion-${randomUUID()}`,
+          title,
+          startMs,
+          endMs,
+          allDay: args.all_day === true,
+          location: typeof args.location === 'string' ? args.location.trim() || undefined : undefined,
+          description: typeof args.description === 'string' ? args.description.trim() || undefined : undefined,
+          timezone: this.opts.timezone,
+        };
+
+        const { file } = readStore(this.opts.dataDir);
+        const nameMap = new Map(file.calendars.map((c) => [c.id, c.name]));
+        const okList: string[] = [];
+        const errList: string[] = [];
+
+        for (const calId of targets) {
+          const label = nameMap.get(calId) ?? calId;
+          try {
+            if (this.opts.writeEvent) {
+              await this.opts.writeEvent(calId, eventInput);
+            } else if (calId.startsWith('caldav:')) {
+              await writeCaldavEvent({
+                calendarId: calId,
+                username: this.opts.cfg.caldavUsername,
+                password: this.opts.cfg.caldavPassword,
+                event: eventInput,
+              });
+            } else if (calId.startsWith('system:')) {
+              await writeSystemCalendarEvent({
+                calendarId: calId,
+                localIcsPaths: this.opts.cfg.localIcsPaths,
+                event: eventInput,
+              });
+            } else {
+              throw new Error('只读日历不支持写入');
+            }
+            okList.push(label);
+          } catch (error) {
+            errList.push(`${label}: ${describeError(error)}`);
+          }
+        }
+
+        if (okList.length > 0) {
+          await this.syncNow().catch(() => undefined);
+        }
+
+        if (errList.length === 0) {
+          return `已写入日历（${okList.join('、')}）：「${clip(title)}」(${formatEventTime(startMs, endMs, this.opts.timezone)})。`;
+        }
+        if (okList.length > 0) {
+          return `部分写入成功（${okList.join('、')}），失败：${errList.join('；')}。`;
+        }
+        return `写入日历失败：${errList.join('；')}。`;
       },
     };
   }

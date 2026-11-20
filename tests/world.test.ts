@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import type { WorldHost } from 'cortico/core/types.ts';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CALENDAR_REMINDER_DEFAULTS, type CalendarReminderConfigSection } from '../src/config.ts';
-import { normalizeCaldavUrl, syncCaldavAndSubscriptions } from '../src/sources/caldav.ts';
-import { syncSystemCalendars } from '../src/sources/system.ts';
+import { normalizeCaldavUrl, syncCaldavAndSubscriptions, writeCaldavEvent } from '../src/sources/caldav.ts';
+import { syncSystemCalendars, writeSystemCalendarEvent } from '../src/sources/system.ts';
 import { CalendarReminderWorld } from '../src/world.ts';
 
 const tempDirs: string[] = [];
@@ -185,5 +185,107 @@ describe('CalendarReminderWorld & sources', () => {
     expect(normalizeCaldavUrl('webdavs://cal.example.com/calendar')).toBe('https://cal.example.com/calendar');
     expect(normalizeCaldavUrl('dav://cal.example.com/dav')).toBe('https://cal.example.com/dav');
     expect(normalizeCaldavUrl('http://localhost:5232/cal/')).toBe('http://localhost:5232/cal/');
+  });
+
+  it('supports toggleWrite and calendar_add to writable calendars', async () => {
+    const dataDir = makeTempDir('cal-write-');
+    const icsFile = join(dataDir, 'local.ics');
+    writeFileSync(icsFile, 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n', 'utf8');
+
+    const cfg: CalendarReminderConfigSection = {
+      ...CALENDAR_REMINDER_DEFAULTS,
+      enabled: true,
+      localIcsPaths: icsFile,
+    };
+
+    const written: Array<{ calId: string; title: string }> = [];
+    const host = {
+      pushEvent: async () => {},
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    } as unknown as WorldHost;
+
+    const world = new CalendarReminderWorld({
+      cfg,
+      timezone: 'Asia/Shanghai',
+      dataDir,
+      now: () => Date.parse('2026-11-20T16:00:00+08:00'),
+      syncSources: async () => ({
+        events: [],
+        calendars: [{ id: 'caldav:https://cal.example.com/work/', name: '工作日历', source: 'caldav', count: 0, writable: true }],
+        reports: [],
+      }),
+      writeEvent: async (calId, ev) => {
+        written.push({ calId, title: ev.title });
+      },
+    });
+
+    await world.start(host);
+    const addTool = world.tools().find((t) => t.name === 'calendar_add')!;
+
+    // No writable calendar selected yet
+    const blocked = await addTool.handler({ title: '测试日程', start: '2026-11-21T10:00:00+08:00' }, {} as never);
+    expect(blocked).toContain('尚未勾选任何可写入的目标日历');
+
+    // Enable write via toggleWrite
+    const state = await world.webUi().invoke!('calendars', 'toggleWrite', ['caldav:https://cal.example.com/work/', true]) as {
+      calendars: Array<{ allowWrite: boolean }>;
+    };
+    expect(state.calendars[0]!.allowWrite).toBe(true);
+
+    const okRes = await addTool.handler({
+      title: '项目周会',
+      start: '2026-11-21T10:00:00+08:00',
+      end: '2026-11-21T11:00:00+08:00',
+    }, {} as never);
+    expect(okRes).toContain('已写入日历（工作日历）');
+    expect(written).toEqual([{ calId: 'caldav:https://cal.example.com/work/', title: '项目周会' }]);
+
+    // Test writeSystemCalendarEvent on Linux local .ics file
+    await writeSystemCalendarEvent({
+      calendarId: 'system:本地',
+      localIcsPaths: icsFile,
+      platform: 'linux',
+      event: {
+        uid: 'u-local-write',
+        title: '本地写入测试',
+        startMs: Date.parse('2026-11-21T14:00:00+08:00'),
+        endMs: Date.parse('2026-11-21T15:00:00+08:00'),
+        timezone: 'Asia/Shanghai',
+      },
+    });
+    const sysRead = await syncSystemCalendars({
+      systemCalendarEnabled: false,
+      localIcsPaths: icsFile,
+      windowStartMs: Date.parse('2026-11-21T00:00:00+08:00'),
+      windowEndMs: Date.parse('2026-11-22T00:00:00+08:00'),
+      defaultTimezone: 'Asia/Shanghai',
+      platform: 'linux',
+    });
+    expect(sysRead.events.some((e) => e.title === '本地写入测试')).toBe(true);
+
+    // Test writeCaldavEvent PUT
+    let putMethod = '';
+    let putBody = '';
+    await writeCaldavEvent({
+      calendarId: 'caldav:https://cal.example.com/work/',
+      username: 'u',
+      password: 'p',
+      event: {
+        uid: 'u-dav-1',
+        title: 'DAV 写入',
+        startMs: Date.parse('2026-11-21T16:00:00+08:00'),
+        endMs: Date.parse('2026-11-21T16:00:00+08:00'),
+        timezone: 'Asia/Shanghai',
+      },
+      fetchImpl: async (_url, init) => {
+        putMethod = init?.method ?? '';
+        putBody = String(init?.body ?? '');
+        return new Response('', { status: 201 });
+      },
+    });
+    expect(putMethod).toBe('PUT');
+    expect(putBody).toContain('SUMMARY:DAV 写入');
+
+    await world.stop();
   });
 });

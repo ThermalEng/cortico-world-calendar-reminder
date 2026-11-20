@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-calendar-reminder",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "日历提醒：从系统日历（Linux/Windows/macOS）或 CalDAV / ICS 订阅提取日程并按时提醒。支持点任务单次提醒、区间任务多种重复频率与结束提醒。",
   "license": "MIT",

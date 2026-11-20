@@ -465,3 +465,76 @@ export function parseIcs(icsText: string, opts: ParseIcsOptions): CalendarEvent[
 
   return events;
 }
+
+export interface NewIcsEventInput {
+  uid: string;
+  title: string;
+  startMs: number;
+  endMs: number;
+  allDay?: boolean;
+  location?: string;
+  description?: string;
+  timezone: string;
+}
+
+function escapeIcsText(text: string): string {
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/\r?\n/g, '\\n')
+    .replace(/,/g, '\\,')
+    .replace(/;/g, '\\;');
+}
+
+function formatIcsUtc(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`;
+}
+
+function formatIcsDateOnly(ms: number, timezone: string): string {
+  const fmt = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: resolveTimezone(timezone, 'UTC'),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return fmt.format(new Date(ms)).replace(/-/g, '');
+}
+
+/** 生成单个 VEVENT 块（不含 VCALENDAR 外壳）。 */
+export function buildVEventBlock(input: NewIcsEventInput): string {
+  const lines: string[] = [
+    'BEGIN:VEVENT',
+    `UID:${input.uid}`,
+    `DTSTAMP:${formatIcsUtc(Date.now())}`,
+    `SUMMARY:${escapeIcsText(input.title)}`,
+  ];
+  if (input.allDay) {
+    lines.push(`DTSTART;VALUE=DATE:${formatIcsDateOnly(input.startMs, input.timezone)}`);
+    if (input.endMs > input.startMs) {
+      lines.push(`DTEND;VALUE=DATE:${formatIcsDateOnly(input.endMs, input.timezone)}`);
+    }
+  } else {
+    lines.push(`DTSTART:${formatIcsUtc(input.startMs)}`);
+    if (input.endMs > input.startMs) {
+      lines.push(`DTEND:${formatIcsUtc(input.endMs)}`);
+    }
+  }
+  if (input.location?.trim()) lines.push(`LOCATION:${escapeIcsText(input.location.trim())}`);
+  if (input.description?.trim()) lines.push(`DESCRIPTION:${escapeIcsText(input.description.trim())}`);
+  lines.push('END:VEVENT');
+  return lines.join('\r\n');
+}
+
+/** 生成完整的 RFC 5545 VCALENDAR 文本，用于 CalDAV PUT 或 .ics 写入。 */
+export function buildIcsCalendar(input: NewIcsEventInput): string {
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Coopanion//cortico-world-calendar-reminder//CN',
+    'CALSCALE:GREGORIAN',
+    buildVEventBlock(input),
+    'END:VCALENDAR',
+    '',
+  ].join('\r\n');
+}

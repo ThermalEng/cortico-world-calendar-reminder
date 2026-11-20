@@ -7,6 +7,8 @@ export interface CalendarPanelItem {
   source: 'system' | 'caldav' | 'ics';
   count: number;
   enabled: boolean;
+  writable: boolean;
+  allowWrite: boolean;
 }
 
 export interface CalendarPanelState {
@@ -23,7 +25,10 @@ function panelCopy(language: Language) {
     syncing: zh ? '同步中…' : 'Syncing…',
     syncDone: zh ? '同步完成' : 'Sync completed',
     empty: zh ? '暂未发现日历，请先启用系统日历或填写 CalDAV 地址后点击「立即同步」。' : 'No calendars discovered yet. Enable system calendar or set CalDAV URL, then click Sync now.',
-    hint: zh ? '勾选需要提醒的日历；取消勾选的日历将不会触发提醒或出现在待办列表中。' : 'Check the calendars you want reminders from. Unchecked calendars are muted.',
+    hint: zh ? '勾选「提醒」接收日程通知；勾选「写入」允许 Coopanion 制定日程时写入该日历（只读 ICS 订阅不可写入）。' : 'Check "Remind" for notifications; check "Write" to allow Coopanion to create events in that calendar (read-only ICS feeds cannot be written).',
+    remindCol: zh ? '提醒' : 'Remind',
+    writeCol: zh ? '写入' : 'Write',
+    readOnlyHint: zh ? '只读订阅不支持写入' : 'Read-only subscription',
     sourceLabel: (s: CalendarPanelItem['source']) => (s === 'caldav' ? 'CalDAV' : s === 'ics' ? 'ICS' : (zh ? '系统日历' : 'System')),
     countLabel: (n: number) => (zh ? `${n} 条日程` : `${n} events`),
   };
@@ -53,6 +58,20 @@ const panel: WebUiPanel = {
 
     let busy = false;
 
+    function makeCheck(labelText: string, checked: boolean, disabled: boolean, title: string, onChange: (v: boolean) => void) {
+      const lbl = document.createElement('label');
+      lbl.style.cssText = `display:inline-flex;align-items:center;gap:4px;cursor:${disabled ? 'not-allowed' : 'pointer'};opacity:${disabled ? '0.5' : '1'}`;
+      if (title) lbl.title = title;
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = checked;
+      box.disabled = disabled;
+      box.style.cssText = `width:15px;height:15px;cursor:${disabled ? 'not-allowed' : 'pointer'}`;
+      box.addEventListener('change', () => onChange(box.checked), { signal: ctx.signal });
+      lbl.append(box, document.createTextNode(labelText));
+      return lbl;
+    }
+
     function render(state: CalendarPanelState) {
       if (ctx.signal.aborted) return;
       statusPill.textContent = state.lastSyncText;
@@ -66,17 +85,17 @@ const panel: WebUiPanel = {
       }
 
       for (const cal of state.calendars) {
-        const label = document.createElement('label');
-        label.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 4px;cursor:pointer;border-radius:6px';
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:6px 4px;border-radius:6px';
 
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = cal.enabled;
-        checkbox.disabled = busy;
-        checkbox.style.cssText = 'width:16px;height:16px;cursor:pointer';
-        checkbox.addEventListener('change', () => {
-          void toggleCalendar(cal.id, checkbox.checked);
-        }, { signal: ctx.signal });
+        const remindCheck = makeCheck(t.remindCol, cal.enabled, busy, '', (v) => void invokeMethod('toggle', [cal.id, v]));
+        const writeCheck = makeCheck(
+          t.writeCol,
+          cal.allowWrite,
+          busy || !cal.writable,
+          cal.writable ? '' : t.readOnlyHint,
+          (v) => void invokeMethod('toggleWrite', [cal.id, v]),
+        );
 
         const nameEl = ui.h('strong', '', cal.name);
         nameEl.style.cssText = 'flex:1;min-width:120px';
@@ -84,16 +103,16 @@ const panel: WebUiPanel = {
         const srcPill = ui.pill(t.sourceLabel(cal.source), 'plain');
         const cntEl = ui.h('small', '', t.countLabel(cal.count));
 
-        label.append(checkbox, nameEl, srcPill, cntEl);
-        listEl.append(label);
+        row.append(remindCheck, writeCheck, nameEl, srcPill, cntEl);
+        listEl.append(row);
       }
     }
 
-    async function toggleCalendar(id: string, enabled: boolean) {
+    async function invokeMethod(method: string, args: unknown[]) {
       if (busy) return;
       busy = true;
       try {
-        const state = await ctx.invoke<CalendarPanelState>('toggle', [id, enabled]);
+        const state = await ctx.invoke<CalendarPanelState>(method, args);
         render(state);
       } catch (error) {
         if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');

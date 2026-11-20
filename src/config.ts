@@ -37,6 +37,8 @@ export interface CalendarReminderConfigSection {
   lookaheadDays: number;
   /** 在面板中取消勾选的日历 ID 列表，热改。 */
   disabledCalendars: string[];
+  /** 在面板中勾选允许写入的日历 ID 列表，热改。 */
+  writableCalendars: string[];
 }
 
 export const CALENDAR_REMINDER_DEFAULTS: CalendarReminderConfigSection = {
@@ -52,6 +54,7 @@ export const CALENDAR_REMINDER_DEFAULTS: CalendarReminderConfigSection = {
   caldavPassword: '',
   lookaheadDays: 7,
   disabledCalendars: [],
+  writableCalendars: [],
 };
 
 /** 区间提醒频率对应的毫秒间隔；once 返回 0。 */

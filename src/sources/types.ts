@@ -32,6 +32,7 @@ export interface DiscoveredCalendar {
   name: string;
   source: CalendarSourceKind;
   count: number;
+  writable?: boolean;
 }
 
 /** 判断是否为区间任务（结束时间严格晚于开始时间）。 */

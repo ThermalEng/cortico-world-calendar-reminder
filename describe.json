@@ -60,6 +60,51 @@
         "zh": "静默指定区间日程的后续重复提醒。",
         "en": "Mute further interval reminders for a specific calendar event."
       }
+    },
+    {
+      "name": "calendar_add",
+      "description": "Create a new calendar event in the user-selected writable calendar(s). Use ONLY when the user explicitly asks to add to a calendar or schedule a calendar event (NOT for general alarms/reminders).",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Title/summary of the calendar event."
+          },
+          "start": {
+            "type": "string",
+            "description": "Start time in ISO 8601 with timezone offset, e.g. 2026-11-21T14:00:00+08:00."
+          },
+          "end": {
+            "type": "string",
+            "description": "Optional end time in ISO 8601 with timezone offset; omit for a point event."
+          },
+          "location": {
+            "type": "string",
+            "description": "Optional event location."
+          },
+          "description": {
+            "type": "string",
+            "description": "Optional event notes or description."
+          },
+          "all_day": {
+            "type": "boolean",
+            "description": "Whether this is an all-day event."
+          }
+        },
+        "required": [
+          "title",
+          "start"
+        ]
+      },
+      "tags": [
+        "write"
+      ],
+      "summary": {
+        "zh": "向已勾选的可写日历写入一条新日程（仅在用户明确要求写入日历/日程时使用，普通提醒请用闹钟）。",
+        "en": "Write a new event to selected writable calendar(s) (use only when explicitly asked for a calendar/schedule event)."
+      }
     }
   ],
   "events": [
@@ -90,7 +135,7 @@
       "key": "worlds.calendar-reminder.envPrompt",
       "title": "日历提醒 · 环境提示词",
       "role": "envPrompt",
-      "content": "这是一个日历提醒 World：定期从本机系统日历与 CalDAV / ICS 订阅同步日程，到点由 World 主动推事件叫你，不需要轮询。\n当前时间 {{calendar.now}}；{{calendar.summary}}；下一条日程是 {{calendar.next}}。\n当收到 `calendar.due` 或 `calendar.ended` 事件时，用自然、简短的语气提醒用户（若当前环境有 `pet_say` 等播报工具可一并调用）；如果用户表示某条进行中的区间日程不再需要继续提醒，可调用 `calendar_ack` 静默该条日程的后续重复提醒。\n用户询问近期日程或要求立即刷新日历时，可调用 `calendar_list` 或 `calendar_sync`。\n"
+      "content": "这是一个日历提醒 World：定期从本机系统日历与 CalDAV / ICS 订阅同步日程，到点由 World 主动推事件叫你，不需要轮询。\n当前时间 {{calendar.now}}；{{calendar.summary}}；下一条日程是 {{calendar.next}}。\n当收到 `calendar.due` 或 `calendar.ended` 事件时，用自然、简短的语气提醒用户（若当前环境有 `pet_say` 等播报工具可一并调用）；如果用户表示某条进行中的区间日程不再需要继续提醒，可调用 `calendar_ack` 静默该条日程的后续重复提醒。\n用户询问近期日程或要求立即刷新日历时，可调用 `calendar_list` 或 `calendar_sync`。\n\n重要约束（区分「闹钟/一般提醒」与「日历/日程」）：\n- 一般的提醒、倒计时、定时任务（如“10 分钟后提醒我喝水”“明天 8 点叫我”），一律使用闹钟 / 提醒工具，**禁止**写入日历。\n- **只有当用户明确要求写入「日历」或制定「日程」**（如“帮我记到日历里”“在日历上安排一个日程”）时，才调用 `calendar_add` 写入已勾选的可写日历。\n"
     }
   ]
 }

@@ -3,11 +3,12 @@
  * 纯 Node.js >=22 实现，不依赖原生 C++ 插件，三端开箱可用。
  */
 import { execFile } from 'node:child_process';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { parseIcs } from '../ics.ts';
+import { buildIcsCalendar, buildVEventBlock, parseIcs, type NewIcsEventInput } from '../ics.ts';
 import type { CalendarEvent, DiscoveredCalendar, SyncSourceReport } from './types.ts';
 
 const execFileAsync = promisify(execFile);
@@ -380,7 +381,110 @@ export async function syncSystemCalendars(opts: SystemCalendarOptions): Promise<
   for (const ev of dedup.values()) {
     const existing = calMap.get(ev.calendarId);
     if (existing) existing.count++;
-    else calMap.set(ev.calendarId, { id: ev.calendarId, name: ev.calendarName ?? '系统日历', source: 'system', count: 1 });
+    else calMap.set(ev.calendarId, { id: ev.calendarId, name: ev.calendarName ?? '系统日历', source: 'system', count: 1, writable: true });
   }
   return { events: [...dedup.values()], calendars: [...calMap.values()], reports };
+}
+
+/** 将新日程写入系统日历（macOS EventKit / Windows WinRT|Outlook / Linux 本地 .ics）。 */
+export async function writeSystemCalendarEvent(opts: {
+  calendarId: string;
+  localIcsPaths?: string;
+  event: NewIcsEventInput;
+  platform?: NodeJS.Platform;
+  homeDir?: string;
+}): Promise<void> {
+  const platform = opts.platform ?? process.platform;
+  const calName = opts.calendarId.startsWith('system:') ? opts.calendarId.slice('system:'.length) : opts.calendarId;
+
+  if (platform === 'darwin') {
+    const jxa = `
+ObjC.import('EventKit');
+function run() {
+  var store = $.EKEventStore.alloc.init;
+  var ev = $.EKEvent.eventWithEventStore(store);
+  ev.title = ${JSON.stringify(opts.event.title)};
+  ev.startDate = $.NSDate.dateWithTimeIntervalSince1970(${opts.event.startMs / 1000});
+  ev.endDate = $.NSDate.dateWithTimeIntervalSince1970(${Math.max(opts.event.startMs, opts.event.endMs) / 1000});
+  ev.allDay = ${Boolean(opts.event.allDay)};
+  ${opts.event.location ? `ev.location = ${JSON.stringify(opts.event.location)};` : ''}
+  ${opts.event.description ? `ev.notes = ${JSON.stringify(opts.event.description)};` : ''}
+  var targetCal = store.defaultCalendarForNewEvents;
+  var cals = store.calendarsForEntityType($.EKEntityTypeEvent);
+  for (var i = 0; i < (cals ? cals.count : 0); i++) {
+    var c = cals.objectAtIndex(i);
+    if (ObjC.unwrap(c.title) === ${JSON.stringify(calName)}) { targetCal = c; break; }
+  }
+  ev.calendar = targetCal;
+  var err = Ref();
+  var ok = store.saveEventSpanCommitError(ev, $.EKSpanThisEvent, true, err);
+  if (!ok) return JSON.stringify({ error: err[0] ? ObjC.unwrap(err[0].localizedDescription) : 'macOS 写入日历失败' });
+  return JSON.stringify({ ok: true });
+}`;
+    const { stdout } = await execFileAsync('osascript', ['-l', 'JavaScript', '-e', jxa], { timeout: CMD_TIMEOUT_MS });
+    const parsed = JSON.parse(stdout.trim() || '{}') as { ok?: boolean; error?: string };
+    if (!parsed.ok) throw new Error(parsed.error ?? 'macOS 写入日历失败');
+    return;
+  }
+
+  if (platform === 'win32') {
+    const startIso = new Date(opts.event.startMs).toISOString();
+    const durationMin = Math.max(0, Math.round((opts.event.endMs - opts.event.startMs) / 60_000));
+    const script = `
+$ErrorActionPreference = 'Stop'
+$start = [DateTimeOffset]::Parse('${startIso}').LocalDateTime
+$title = ${JSON.stringify(opts.event.title)}
+$loc = ${JSON.stringify(opts.event.location ?? '')}
+$desc = ${JSON.stringify(opts.event.description ?? '')}
+try {
+  $outlook = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
+  if ($outlook) {
+    $appt = $outlook.CreateItem(1)
+    $appt.Subject = $title
+    $appt.Start = $start
+    $appt.Duration = ${durationMin}
+    $appt.AllDayEvent = $${Boolean(opts.event.allDay)}
+    if ($loc) { $appt.Location = $loc }
+    if ($desc) { $appt.Body = $desc }
+    $appt.Save()
+    return
+  }
+} catch {}
+throw '当前未检测到可写入的 Windows Outlook 客户端'
+`;
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    await execFileAsync(
+      'powershell.exe',
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
+      { timeout: CMD_TIMEOUT_MS },
+    );
+    return;
+  }
+
+  // Linux: 写入本地 .ics 文件（优先自定义 localIcsPaths，其次 Evolution / KOrganizer 默认路径）
+  const home = opts.homeDir ?? homedir();
+  const candidates = [
+    ...splitPathList(opts.localIcsPaths ?? '').map((p) => (p.startsWith('~/') ? join(home, p.slice(2)) : resolve(p))),
+    join(home, '.local/share/evolution/calendar/system/calendar.ics'),
+    join(home, '.local/share/apps/korganizer/std.ics'),
+  ];
+  for (const target of candidates) {
+    if (!existsSync(target)) continue;
+    const st = await stat(target);
+    if (st.isDirectory()) {
+      await writeFile(join(target, `${opts.event.uid}.ics`), buildIcsCalendar(opts.event), 'utf8');
+      return;
+    }
+    if (st.isFile() && target.toLowerCase().endsWith('.ics')) {
+      const content = await readFile(target, 'utf8');
+      const endIdx = content.lastIndexOf('END:VCALENDAR');
+      const vevent = buildVEventBlock(opts.event);
+      const updated = endIdx >= 0
+        ? `${content.slice(0, endIdx).replace(/\s*$/, '')}\r\n${vevent}\r\nEND:VCALENDAR\r\n`
+        : buildIcsCalendar(opts.event);
+      await writeFile(target, updated, 'utf8');
+      return;
+    }
+  }
+  throw new Error('未找到可写入的本地 Linux 日历 .ics 文件');
 }

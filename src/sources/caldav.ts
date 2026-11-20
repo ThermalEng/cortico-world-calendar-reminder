@@ -5,7 +5,7 @@
  * 2) CalDAV 服务自动发现（PROPFIND current-user-principal -> calendar-home-set -> calendar collections）
  * 3) 标准 REPORT calendar-query 以及两步式 REPORT calendar-multiget（兼容飞书等服务端）
  */
-import { parseIcs } from '../ics.ts';
+import { buildIcsCalendar, parseIcs, type NewIcsEventInput } from '../ics.ts';
 import type { CalendarEvent, DiscoveredCalendar, SyncSourceReport } from './types.ts';
 
 export interface CaldavSyncOptions {
@@ -346,7 +346,7 @@ export async function syncCaldavAndSubscriptions(opts: CaldavSyncOptions): Promi
       const calName = events[0]?.calendarName ?? 'ICS 订阅';
       return {
         events,
-        calendars: [{ id: `ics:${url}`, name: calName, source: 'ics', count: events.length }],
+        calendars: [{ id: `ics:${url}`, name: calName, source: 'ics', count: events.length, writable: false }],
         reports: [{ source: url, count: events.length }],
       };
     }
@@ -366,7 +366,7 @@ export async function syncCaldavAndSubscriptions(opts: CaldavSyncOptions): Promi
       const calName = events[0]?.calendarName ?? 'CalDAV';
       return {
         events,
-        calendars: [{ id: calId, name: calName, source: 'caldav', count: events.length }],
+        calendars: [{ id: calId, name: calName, source: 'caldav', count: events.length, writable: true }],
         reports: [{ source: url, count: events.length }],
       };
     }
@@ -394,7 +394,7 @@ export async function syncCaldavAndSubscriptions(opts: CaldavSyncOptions): Promi
             events.push(...parsed);
           }
         }
-        calendars.push({ id: `caldav:${col.url}`, name: col.name, source: 'caldav', count: colCount });
+        calendars.push({ id: `caldav:${col.url}`, name: col.name, source: 'caldav', count: colCount, writable: true });
       }
       const dedup = new Map<string, CalendarEvent>();
       for (const ev of events) dedup.set(ev.key, ev);
@@ -425,7 +425,7 @@ export async function syncCaldavAndSubscriptions(opts: CaldavSyncOptions): Promi
         const calName = events[0]?.calendarName ?? 'ICS 订阅';
         return {
           events,
-          calendars: [{ id: calId, name: calName, source: 'ics', count: events.length }],
+          calendars: [{ id: calId, name: calName, source: 'ics', count: events.length, writable: false }],
           reports: [{ source: url, count: events.length }],
         };
       }
@@ -450,5 +450,36 @@ export async function syncCaldavAndSubscriptions(opts: CaldavSyncOptions): Promi
         error: error instanceof Error ? error.message : String(error),
       }],
     };
+  }
+}
+
+export async function writeCaldavEvent(opts: {
+  calendarId: string;
+  username: string;
+  password: string;
+  event: NewIcsEventInput;
+  fetchImpl?: typeof fetch;
+}): Promise<void> {
+  if (!opts.calendarId.startsWith('caldav:')) {
+    throw new Error('该日历不是可写的 CalDAV 日历');
+  }
+  const collectionUrl = opts.calendarId.slice('caldav:'.length).replace(/\/?$/, '/');
+  const targetUrl = `${collectionUrl}${encodeURIComponent(opts.event.uid)}.ics`;
+  const fetchFn = opts.fetchImpl ?? fetch;
+  const authHeader = buildAuthHeader(opts.username, opts.password);
+  const headers: Record<string, string> = {
+    'Content-Type': 'text/calendar; charset=utf-8',
+    'If-None-Match': '*',
+  };
+  if (authHeader) headers.Authorization = authHeader;
+
+  const res = await fetchFn(targetUrl, {
+    method: 'PUT',
+    headers,
+    body: buildIcsCalendar(opts.event),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    throw new Error(`CalDAV 写入失败: HTTP ${res.status}`);
   }
 }
